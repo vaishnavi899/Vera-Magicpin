@@ -16,7 +16,7 @@ MODEL = "llama-3.3-70b-versatile"
 # Thread pool for parallel Groq calls
 _executor = ThreadPoolExecutor(max_workers=10)
 
-# ── Category voice config ────────────────────────────────────────────────────
+# ── Category voice config
 CATEGORY_VOICE = {
     "dentists": {
         "noun": "patients", "tone": "peer_clinical",
@@ -50,7 +50,7 @@ CATEGORY_VOICE = {
     },
 }
 
-# ── Trigger kind → message strategy ─────────────────────────────────────────
+# ── Trigger kind → message strategy
 TRIGGER_STRATEGY = {
     "research_digest":           "Share a relevant research finding that affects this merchant's patient/client mix",
     "regulation_change":         "Alert about compliance deadline with specific action needed",
@@ -357,7 +357,7 @@ Do NOT default to conversion gap if the trigger is about something else."""
         return fb
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Endpoints
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
