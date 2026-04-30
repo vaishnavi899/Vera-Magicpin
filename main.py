@@ -1,10 +1,5 @@
-"""
-Vera Bot — magicpin AI Challenge (v13)
-Built from actual dataset: real trigger kinds, category voices, merchant signals.
-Target: 42-46/50
-"""
-
-import os, json, hashlib
+import os, json, hashlib, asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,13 +7,16 @@ load_dotenv()
 from groq import Groq
 from fastapi import FastAPI, Request
 
-app = FastAPI(title="Vera Bot", version="13.0.0")
+app = FastAPI(title="Vera Bot", version="14.0.0")
 context_store = {}
 conversation_store = {}
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 MODEL = "llama-3.3-70b-versatile"
 
-# ── Category voice config (from actual category JSONs) ──────────────────────
+# Thread pool for parallel Groq calls
+_executor = ThreadPoolExecutor(max_workers=10)
+
+# ── Category voice config ────────────────────────────────────────────────────
 CATEGORY_VOICE = {
     "dentists": {
         "noun": "patients", "tone": "peer_clinical",
@@ -52,45 +50,51 @@ CATEGORY_VOICE = {
     },
 }
 
-# ── Trigger kind → message strategy ────────────────────────────────────────
+# ── Trigger kind → message strategy ─────────────────────────────────────────
 TRIGGER_STRATEGY = {
-    "research_digest":       "Share a relevant research finding that affects this merchant's patient/client mix",
-    "regulation_change":     "Alert about compliance deadline with specific action needed",
-    "recall_due":            "Patient recall message — use their name, service due, available slots",
-    "perf_dip":              "Performance is down X% — lead with the dip metric, offer a fix",
-    "renewal_due":           "Subscription expires in N days — urgency + renewal amount",
-    "festival_upcoming":     "Festival demand is coming — lead with the festival name and days until",
-    "wedding_package_followup": "Wedding is in N days — next step in bridal prep journey",
-    "curious_ask_due":       "Ask merchant what's in demand this week — conversational",
-    "winback_eligible":      "Subscription lapsed N days ago — re-engage with what they're missing",
-    "ipl_match_today":       "IPL match tonight — match-night combo opportunity",
-    "review_theme_emerged":  "A review pattern emerged — address the theme operationally",
-    "milestone_reached":     "Almost at a milestone (e.g. 150 reviews) — capitalize on momentum",
-    "active_planning_intent":"Continue the conversation from merchant's last message",
-    "seasonal_perf_dip":     "Expected seasonal dip — reassure and suggest retention focus",
-    "customer_lapsed_hard":  "Customer hasn't visited in N days — winback message to merchant",
-    "trial_followup":        "Trial completed — next session booking opportunity",
-    "supply_alert":          "Urgent supply/recall alert — pull batches, inform affected customers",
-    "chronic_refill_due":    "Customer's chronic meds run out on DATE — set up delivery now",
-    "category_seasonal":     "Seasonal demand shift — shelf action + offer push",
-    "gbp_unverified":        "Unverified GBP means 30% fewer impressions — verify now",
-    "cde_opportunity":       "Free CDE credits available — relevant to their practice",
-    "competitor_opened":     "New competitor nearby with a lower price offer",
-    "perf_spike":            "Performance spike — capitalize on momentum",
-    "dormant_with_vera":     "Merchant hasn't replied in N days — re-engage gently",
-    "ipl_match_today":       "IPL tonight in city — match-night promo window",
+    "research_digest":           "Share a relevant research finding that affects this merchant's patient/client mix",
+    "regulation_change":         "Alert about compliance deadline with specific action needed",
+    "recall_due":                "Patient recall message — use their name, service due, available slots",
+    "perf_dip":                  "Performance is down X% — lead with the dip metric, offer a fix",
+    "renewal_due":               "Subscription expires in N days — urgency + renewal amount",
+    "festival_upcoming":         "Festival demand is coming — lead with the festival name and days until",
+    "wedding_package_followup":  "Wedding is in N days — next step in bridal prep journey",
+    "curious_ask_due":           "Ask merchant what's in demand this week — conversational",
+    "winback_eligible":          "Subscription lapsed N days ago — re-engage with what they're missing",
+    "ipl_match_today":           "IPL match tonight — match-night combo opportunity",
+    "review_theme_emerged":      "A review pattern emerged — address the theme operationally",
+    "milestone_reached":         "Almost at a milestone (e.g. 150 reviews) — capitalize on momentum",
+    "active_planning_intent":    "Continue the conversation from merchant's last message",
+    "seasonal_perf_dip":         "Expected seasonal dip — reassure and suggest retention focus",
+    "customer_lapsed_hard":      "Customer hasn't visited in N days — winback message to merchant",
+    "trial_followup":            "Trial completed — next session booking opportunity",
+    "supply_alert":              "Urgent supply/recall alert — pull batches, inform affected customers",
+    "chronic_refill_due":        "Customer's chronic meds run out on DATE — set up delivery now",
+    "category_seasonal":         "Seasonal demand shift — shelf action + offer push",
+    "gbp_unverified":            "Unverified GBP means 30% fewer impressions — verify now",
+    "cde_opportunity":           "Free CDE credits available — relevant to their practice",
+    "competitor_opened":         "New competitor nearby with a lower price offer",
+    "perf_spike":                "Performance spike — capitalize on momentum",
+    "dormant_with_vera":         "Merchant hasn't replied in N days — re-engage gently",
 }
+
 
 def get_ctx(scope, cid):
     e = context_store.get(f"{scope}:{cid}")
     return e["payload"] if e else None
 
+
 def pick_best_offer(merchant):
     offers = merchant.get("offers", [])
     active = [o for o in offers if o.get("status") == "active"]
     pool = active or offers
-    if not pool: return None
-    return sorted(pool, key=lambda o: float(str(o.get("price", o.get("value", "9999"))).replace("₹","").replace(",","").split()[0]) if str(o.get("price", o.get("value","9999"))).replace("₹","").replace(",","").split()[0].replace(".","").isdigit() else 9999)[0]
+    if not pool:
+        return None
+    def price_key(o):
+        raw = str(o.get("price", o.get("value", "9999"))).replace("₹", "").replace(",", "").split()[0]
+        return float(raw) if raw.replace(".", "").isdigit() else 9999
+    return sorted(pool, key=price_key)[0]
+
 
 def clean_name(name, cat):
     """Never double-prefix Dr."""
@@ -98,12 +102,13 @@ def clean_name(name, cat):
         return f"Dr. {name}"
     return name
 
+
 def build_system_prompt(cat):
     voice = CATEGORY_VOICE.get(cat, CATEGORY_VOICE["pharmacies"])
     return f"""You are Vera, magicpin's AI growth assistant. Compose ONE message for a {cat} merchant.
 
 VOICE FOR {cat.upper()}: {voice['tone']}
-- Address noun: {voice['noun']}  
+- Address noun: {voice['noun']}
 - Salutation style: {voice['salutation']}
 - NEVER use: {voice['taboo']}
 - Tone example: "{voice['example']}"
@@ -124,6 +129,7 @@ RULES:
 OUTPUT: JSON only.
 {{"body": "...", "cta": "...", "send_as": "vera", "suppression_key": "slug", "rationale": "trigger_kind + key signal used"}}"""
 
+
 def build_fallback(merchant, trigger, cat):
     """Trigger-aware fallback using real dataset structure."""
     identity = merchant.get("identity", {})
@@ -134,7 +140,6 @@ def build_fallback(merchant, trigger, cat):
     perf = merchant.get("performance", {})
     views = perf.get("views", 0)
     calls = perf.get("calls", 0)
-    signals = merchant.get("signals", [])
     voice = CATEGORY_VOICE.get(cat, CATEGORY_VOICE["pharmacies"])
     noun = voice["noun"]
     offer = pick_best_offer(merchant)
@@ -145,14 +150,12 @@ def build_fallback(merchant, trigger, cat):
 
     kind = trigger.get("kind", "") if trigger else ""
     payload = trigger.get("payload", {}) if trigger else {}
-    urgency = trigger.get("urgency", 1) if trigger else 1
 
-    # ── Trigger-specific message templates ──
     if kind == "perf_dip":
         metric = payload.get("metric", "calls")
         delta = abs(int(payload.get("delta_pct", -0.3) * 100))
         baseline = payload.get("vs_baseline", calls)
-        body = f"{name}: {metric} down {delta}% this week (was {baseline}). {offer_str or 'Want me to fix this?'}"
+        body = f"{name}: {metric} down {delta}% this week (was {baseline}).{offer_str or ' Want me to fix this?'}"
         if offer_str: body += " — push offer to recover?"
         cta = "Reply YES to activate"
         key = f"perf-dip-{raw_name[:12]}"
@@ -246,9 +249,10 @@ def build_fallback(merchant, trigger, cat):
 
     elif kind == "milestone_reached":
         metric = payload.get("metric", "reviews")
-        now = payload.get("value_now", "")
+        now_val = payload.get("value_now", "")
         milestone = payload.get("milestone_value", "")
-        body = f"{name}: {now} {metric} — just {milestone - now if isinstance(now,int) and isinstance(milestone,int) else 'a few'} away from {milestone}! Push{offer_str} to get there this week?"
+        gap = (milestone - now_val) if isinstance(now_val, int) and isinstance(milestone, int) else "a few"
+        body = f"{name}: {now_val} {metric} — just {gap} away from {milestone}! Push{offer_str} to get there this week?"
         cta = "Reply YES to push"
         key = f"milestone-{raw_name[:12]}"
 
@@ -260,8 +264,7 @@ def build_fallback(merchant, trigger, cat):
         key = f"dormant-{raw_name[:12]}"
 
     else:
-        # Generic but uses real numbers
-        conv = round((calls/views)*100, 1) if views else 0
+        conv = round((calls / views) * 100, 1) if views else 0
         body = f"{name}: {views} views → {calls} {noun} ({conv}% CTR) in {locality}."
         if offer_str: body += f" Boost with{offer_str}?"
         cta = "Reply YES / No"
@@ -275,13 +278,18 @@ def build_fallback(merchant, trigger, cat):
         "rationale": f"{kind} | {cat} | {locality}"
     }
 
+
 def compose_for_trigger(tid):
+    """Synchronous — safe to call from thread pool."""
     trigger = get_ctx("trigger", tid)
-    if not trigger: return None
+    if not trigger:
+        return None
     merchant_id = trigger.get("merchant_id")
-    if not merchant_id: return None
+    if not merchant_id:
+        return None
     merchant = get_ctx("merchant", merchant_id)
-    if not merchant: return None
+    if not merchant:
+        return None
 
     cat = merchant.get("category_slug", merchant.get("category", "pharmacies"))
     identity = merchant.get("identity", {})
@@ -294,7 +302,6 @@ def compose_for_trigger(tid):
     kind = trigger.get("kind", "unknown")
     strategy = TRIGGER_STRATEGY.get(kind, "Send a relevant, specific message based on the trigger data")
 
-    # Customer context if available
     customer_info = ""
     cust_id = trigger.get("customer_id")
     if cust_id:
@@ -307,7 +314,8 @@ def compose_for_trigger(tid):
 
     offer_line = ""
     if offer:
-        offer_line = f"\nBEST OFFER: {offer.get('title','')}"
+        price = offer.get("price", offer.get("value", ""))
+        offer_line = f"\nBEST OFFER: {offer.get('title','')} ₹{price}"
 
     prompt = f"""CATEGORY: {cat}
 MERCHANT NAME (use exactly): {display_name}
@@ -316,7 +324,7 @@ LOCALITY: {locality}
 PERFORMANCE: views={perf.get('views','?')}, calls={perf.get('calls','?')}, ctr={perf.get('ctr','?')}
 SIGNALS: {merchant.get('signals',[])}
 SUBSCRIPTION: {merchant.get('subscription',{}).get('status','')} | days_remaining={merchant.get('subscription',{}).get('days_remaining','')}
-OFFERS: {json.dumps([{'title':o.get('title',''),'status':o.get('status','')} for o in merchant.get('offers',[])])}
+OFFERS: {json.dumps([{'title':o.get('title',''),'price':o.get('price',o.get('value','')),'status':o.get('status','')} for o in merchant.get('offers',[])])}
 {offer_line}{customer_info}
 
 TRIGGER KIND: {kind}
@@ -338,7 +346,8 @@ Do NOT default to conversion gap if the trigger is about something else."""
             ],
         )
         result = json.loads(resp.choices[0].message.content.strip())
-        if "body" not in result: raise ValueError("missing body")
+        if "body" not in result:
+            raise ValueError("missing body")
         result["body"] = result["body"].replace("Dr. Dr.", "Dr.")
         return {**result, "merchant_id": merchant_id, "trigger_id": tid}
     except Exception:
@@ -348,20 +357,28 @@ Do NOT default to conversion gap if the trigger is about something else."""
         return fb
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
 
 @app.get("/v1/healthz")
+@app.head("/v1/healthz")
 def healthz():
-    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+    return JSONResponse(content={"status": "ok"})
+
 
 @app.get("/v1/metadata")
 def metadata():
     return {
-        "name": "vera-bot", "version": "13.0.0",
+        "name": "vera-bot", "version": "14.0.0",
         "model": MODEL, "provider": "groq", "author": "challenger",
         "description": "Vera — trigger-aware, category-voiced, offer-specific merchant growth assistant.",
         "endpoints": ["/v1/healthz", "/v1/metadata", "/v1/context", "/v1/tick", "/v1/reply"],
     }
+
 
 @app.post("/v1/context")
 async def receive_context(request: Request):
@@ -380,25 +397,40 @@ async def receive_context(request: Request):
                           "stored_at": stored_at, "ack_id": ack_id}
     return {"accepted": True, "ack_id": ack_id, "stored_at": stored_at}
 
+
 @app.post("/v1/tick")
 async def tick(request: Request):
+    """
+    KEY FIX: run all trigger compositions in parallel via thread pool.
+    Sequential was: 5 triggers × ~2s = 10s → SSL timeout.
+    Parallel is: max(individual times) ≈ 2s total.
+    """
     req = await request.json()
     trigger_ids = req.get("available_triggers", [])
+
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.run_in_executor(_executor, compose_for_trigger, tid)
+        for tid in trigger_ids
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     actions = []
-    for tid in trigger_ids:
-        result = compose_for_trigger(tid)
-        if result:
-            actions.append({
-                "type": "message",
-                "merchant_id": result["merchant_id"],
-                "trigger_id": result["trigger_id"],
-                "body": result["body"],
-                "cta": result["cta"],
-                "send_as": result["send_as"],
-                "suppression_key": result.get("suppression_key", ""),
-                "rationale": result.get("rationale", ""),
-            })
+    for result in results:
+        if isinstance(result, Exception) or result is None:
+            continue
+        actions.append({
+            "type": "message",
+            "merchant_id": result["merchant_id"],
+            "trigger_id": result["trigger_id"],
+            "body": result["body"],
+            "cta": result["cta"],
+            "send_as": result["send_as"],
+            "suppression_key": result.get("suppression_key", ""),
+            "rationale": result.get("rationale", ""),
+        })
     return {"actions": actions}
+
 
 @app.post("/v1/reply")
 async def reply(request: Request):
