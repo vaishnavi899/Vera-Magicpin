@@ -6,7 +6,9 @@ load_dotenv()
 
 from groq import Groq
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+# ── Single app instance (removed duplicate FastAPI() on old line 365)
 app = FastAPI(title="Vera Bot", version="14.0.0")
 context_store = {}
 conversation_store = {}
@@ -358,11 +360,6 @@ Do NOT default to conversion gap if the trigger is about something else."""
 
 
 # ── Endpoints
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
 
 @app.get("/v1/healthz")
 @app.head("/v1/healthz")
