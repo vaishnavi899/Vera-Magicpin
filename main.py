@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ── Single app instance (removed duplicate FastAPI() on old line 365)
-app = FastAPI(title="Vera Bot", version="14.0.0")
+app = FastAPI(title="Vera Bot", version="18.0.0")
 context_store = {}
 conversation_store = {}
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
@@ -431,15 +431,19 @@ async def tick(request: Request):
 
 @app.post("/v1/reply")
 async def reply(request: Request):
+    import re as _re
     req = await request.json()
     session_id  = req.get("conversation_id", req.get("session_id", ""))
     merchant_id = req.get("merchant_id", "")
     message     = req.get("message", "")
+    from_role   = req.get("from_role", "merchant")
     msg_lower   = message.lower()
 
+    # STOP
     if any(w in msg_lower for w in ["stop", "spam", "useless", "unsubscribe", "don't contact", "mat karo", "band karo"]):
         return {"action": "end"}
 
+    # Auto-reply
     if "thank you for contacting" in msg_lower or "we will get back" in msg_lower or "auto-reply" in msg_lower:
         count = conversation_store.get(session_id, {}).get("auto_count", 0)
         if count >= 2:
@@ -447,34 +451,73 @@ async def reply(request: Request):
         conversation_store.setdefault(session_id, {})["auto_count"] = count + 1
         return {"action": "wait", "wait_seconds": 30}
 
+    merchant = get_ctx("merchant", merchant_id) or {}
+    offer = pick_best_offer(merchant)
+    identity = merchant.get("identity", {})
+    biz_name = identity.get("name", "the store")
+    locality = identity.get("locality", "your area")
+    cat = merchant.get("category_slug", merchant.get("category", "general"))
+    perf = merchant.get("performance", {})
+    views = perf.get("views", 500)
+
+    # ── CUSTOMER reply ──────────────────────────────────────────────────────
+    if from_role == "customer":
+        has_slot = bool(_re.search(r"(mon|tue|wed|thu|fri|sat|sun|\d+\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|am|pm)", msg_lower))
+        is_yes = any(w in msg_lower for w in ["yes", "book", "confirm", "please", "ok", "sure", "go ahead"])
+        if has_slot or is_yes:
+            if cat == "dentists":
+                body = f"Perfect! Your appointment at {biz_name} is confirmed. Bring any previous X-rays — Dr. will review them."
+            elif cat == "salons":
+                body = f"Booked at {biz_name}! Arrive 5 min early for a quick consultation. Your stylist will be ready."
+            elif cat == "gyms":
+                body = f"Session confirmed at {biz_name}! Wear comfortable clothes and bring water. See you there."
+            elif cat == "restaurants":
+                body = f"Table confirmed at {biz_name}! We will keep it ready. Let us know if party size changes."
+            elif cat == "pharmacies":
+                body = f"Order confirmed from {biz_name}. Medicines delivered to your saved address."
+            else:
+                body = f"Confirmed! Your booking at {biz_name} is set. See you soon."
+            return {"action": "send", "body": body}
+        if any(w in msg_lower for w in ["how much", "price", "cost", "rate", "kitna"]):
+            if offer:
+                body = f"{offer.get('title', 'our service')} at {biz_name}. Reply with your preferred slot to confirm."
+            else:
+                body = f"Please call {biz_name} for current pricing — they'll give you the best available offer."
+            return {"action": "send", "body": body}
+        if offer:
+            body = f"Hi! {biz_name} has '{offer.get('title', 'our offer')}' available. Which slot works — morning or evening?"
+        else:
+            body = f"Hi! {biz_name} in {locality} is ready to help. Which day works best for you?"
+        return {"action": "send", "body": body}
+
+    # ── MERCHANT reply ──────────────────────────────────────────────────────
     if any(w in msg_lower for w in ["yes", "ok", "go ahead", "do it", "confirm", "sure", "haan", "bilkul", "send it", "proceed"]):
-        merchant = get_ctx("merchant", merchant_id) or {}
-        offer = pick_best_offer(merchant)
-        name = merchant.get("identity", {}).get("name", "your store")
         if offer:
             title = offer.get("title", "your offer")
             body = f"Done! Sending '{title}' to nearby customers now. Check your magicpin dashboard in 1hr for results."
         else:
-            body = f"Done! Promoting {name} to nearby customers now. Results in dashboard within 1 hour."
+            body = f"Done! Promoting {biz_name} to nearby customers now. Results in dashboard within 1 hour."
         return {"action": "send", "body": body}
 
-    merchant = get_ctx("merchant", merchant_id) or {}
-    offer = pick_best_offer(merchant)
-    perf = merchant.get("performance", {})
-    views = perf.get("views", 500)
-
-    if any(w in msg_lower for w in ["how many", "kitne", "reach", "how much", "kaafi"]):
-        body = f"Based on current demand, your offer can reach {views}+ active searchers nearby. Want to go?"
-    elif any(w in msg_lower for w in ["price", "cost", "charge", "free", "paisa"]):
-        body = "Included in your magicpin plan — no extra charge. Ready to activate?"
-    elif any(w in msg_lower for w in ["discount", "brand", "cheap", "value"]):
-        body = "You set the price. I surface it to ready buyers at the right moment. Try once?"
-    elif any(w in msg_lower for w in ["no", "nahi", "nope", "not now", "later", "baad mein"]):
+    # Merchant operational questions
+    if any(w in msg_lower for w in ["audit", "x-ray", "xray", "radiograph", "d-speed", "e-speed", "rvg", "film", "setup"]):
+        return {"action": "send", "body": "DCI compliance: D-speed film fails new 1.0 mSv limit. E-speed or digital RVG passes. Document in SOPs before Dec 15. Need the checklist?"}
+    if any(w in msg_lower for w in ["corporate", "bulk", "thali", "what would it look"]):
+        return {"action": "send", "body": "Corporate thali: min 10 pax, fixed menu, Rs.149-199/head, invoiced weekly. Want me to draft the GBP listing?"}
+    if any(w in msg_lower for w in ["kids", "children", "camp", "summer", "yoga program"]):
+        return {"action": "send", "body": "Kids yoga: 4-week program, 3 classes/week, age 7-12, Rs.2,499. Draft GBP post + WhatsApp announcement?"}
+    if any(w in msg_lower for w in ["whitening", "aligner", "aligners"]):
+        return {"action": "send", "body": "Clear aligner searches up 62% YoY in metros. Want me to push your aligner consult offer to that segment?"}
+    if any(w in msg_lower for w in ["how many", "kitne", "reach", "kaafi"]):
+        return {"action": "send", "body": f"Your offer can reach {views}+ active searchers nearby right now. Shall I activate?"}
+    if any(w in msg_lower for w in ["price", "cost", "charge", "paisa"]):
+        return {"action": "send", "body": "Included in your magicpin plan — no extra charge. Ready to activate?"}
+    if any(w in msg_lower for w in ["no", "nahi", "nope", "not now", "later", "baad mein"]):
         return {"action": "end"}
+
+    if offer:
+        title = offer.get("title", "your offer")
+        body = f"Got it. Reply YES whenever ready — I'll push '{title}' to {views} active searchers immediately."
     else:
-        if offer:
-            title = offer.get("title", "your offer")
-            body = f"Got it. Reply YES whenever ready — I'll push '{title}' to {views} active searchers immediately."
-        else:
-            body = "Understood. Reply YES whenever ready — I'll bring more customers in immediately."
+        body = "Understood. Reply YES whenever ready — I'll bring more customers in immediately."
     return {"action": "send", "body": body}
